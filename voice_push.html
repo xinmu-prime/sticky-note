@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>语音便利贴推送</title>
+<title>墨水屏便利贴推送</title>
 <!-- MQTT 库：多个 CDN 依次兜底（国内 unpkg/jsdelivr 有时很慢，所以加了两个国内镜像） -->
 <script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script>if (typeof mqtt === 'undefined') document.write('<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"><\/script>');</script>
@@ -62,6 +62,24 @@
   .result .label { font-size: 12px; color: #999; margin-bottom: 8px; }
   .hint { font-size: 13px; color: #999; margin-top: 16px; text-align: center; line-height: 1.6; }
 
+  .tabs { display: flex; gap: 8px; margin-bottom: 14px; width: 100%; max-width: 400px; }
+  .tab { flex: 1; padding: 10px 14px; font-size: 15px;
+         border: 1px solid #ddd; background: #fff; color: #666;
+         border-radius: 10px; }
+  .tab.active { background: #4a90d9; color: #fff; border-color: #4a90d9; font-weight: 600; }
+  .pane { width: 100%; max-width: 400px; }
+  .pane.hidden { display: none; }
+  .text-area { width: 100%; padding: 12px; font-size: 16px; line-height: 1.5;
+               border: 1px solid #ddd; border-radius: 12px; resize: vertical;
+               font-family: inherit; background: #fff; color: #333; }
+  .row { display: flex; align-items: center; justify-content: space-between; margin-top: 10px; }
+  .counter { font-size: 13px; color: #999; }
+  .counter.warn { color: #e67e22; }
+  .send-btn { padding: 12px 22px; font-size: 16px; font-weight: 600;
+              background: #4a90d9; color: #fff; border: none; border-radius: 12px; }
+  .send-btn:active { transform: scale(0.97); }
+  .hint2 { font-size: 12px; color: #999; margin-top: 10px; line-height: 1.6; }
+
   .topic-input {
     width: 100%; max-width: 400px;
     padding: 10px; font-size: 14px;
@@ -71,23 +89,42 @@
 </style>
 </head>
 <body>
-  <h1>语音便利贴推送</h1>
+  <h1>墨水屏便利贴</h1>
   <div id="status" class="status">连接中...</div>
 
   <input id="topic" class="topic-input" value="ai-sticky/note/my-note-001"
          placeholder="MQTT Topic (和固件一致)">
 
-  <button id="mic" class="mic-btn">🎤</button>
+  <div class="tabs">
+    <button id="tab-text" class="tab active">✏️ 文字输入</button>
+    <button id="tab-voice" class="tab">🎤 语音输入</button>
+  </div>
+
+  <!-- 文字输入（默认） -->
+  <div id="pane-text" class="pane">
+    <textarea id="note" class="text-area" rows="4"
+      placeholder="想写什么？输入后点「发送到墨水屏」"></textarea>
+    <div class="row">
+      <span id="counter" class="counter">0 / 120</span>
+      <button id="send" class="send-btn">发送到墨水屏</button>
+    </div>
+  </div>
+
+  <!-- 语音输入 -->
+  <div id="pane-voice" class="pane hidden">
+    <button id="mic" class="mic-btn">🎤</button>
+    <div class="hint2">点一下开始说话，说完自动识别并推送<br>
+      需要安静环境 + Chrome/Safari + HTTPS</div>
+  </div>
 
   <div class="result">
-    <div class="label">识别结果（自动推送到墨水屏）</div>
-    <div id="transcript">— 点击麦克风开始说话 —</div>
+    <div class="label">最近一次推送</div>
+    <div id="transcript">— 还没有推送内容 —</div>
   </div>
 
   <div class="hint">
-    按住或点击麦克风说话<br>
-    说完自动识别并推送<br>
-    需要 Chrome / Safari 浏览器，需 HTTPS 或 localhost 环境
+    文字：Enter 发送、Shift+Enter 换行（手机点按钮）<br>
+    墨水屏每 5 分钟唤醒一次，最多等 5 分钟显示
   </div>
 
 <script>
@@ -98,6 +135,19 @@ const statusEl = document.getElementById('status');
 const micBtn = document.getElementById('mic');
 const transcriptEl = document.getElementById('transcript');
 const topicInput = document.getElementById('topic');
+
+// 记住上次输入的 topic（同一台手机会一直记着，不用每次重打）
+const TOPIC_KEY = 'sticky_mqtt_topic';
+try {
+  const saved = localStorage.getItem(TOPIC_KEY);
+  if (saved) topicInput.value = saved;
+} catch (e) { /* 无痕模式可能禁用 localStorage，忽略 */ }
+topicInput.addEventListener('change', () => {
+  try { localStorage.setItem(TOPIC_KEY, topicInput.value.trim()); } catch (e) {}
+});
+topicInput.addEventListener('blur', () => {
+  try { localStorage.setItem(TOPIC_KEY, topicInput.value.trim()); } catch (e) {}
+});
 
 let client = null;
 let recognition = null;
@@ -143,14 +193,7 @@ if (!SpeechRecognition) {
 
     // 最终结果 -> 推送
     if (e.results[e.results.length - 1].isFinal && text.trim()) {
-      const topic = topicInput.value.trim();
-      client.publish(topic, text.trim(), { qos: 0 });
-      statusEl.textContent = '✓ 已推送: ' + text.trim();
-      statusEl.className = 'status online';
-      setTimeout(() => {
-        statusEl.textContent = '● 已连接, 可以说话';
-        statusEl.className = 'status online';
-      }, 2000);
+      publishNote(text);
     }
   };
 
@@ -182,6 +225,60 @@ micBtn.addEventListener('click', () => {
   if (isListening) recognition.stop();
   else startListening();
 });
+
+// ============ 文字输入 ============
+const noteEl = document.getElementById('note');
+const counterEl = document.getElementById('counter');
+const sendBtn = document.getElementById('send');
+const tabText = document.getElementById('tab-text');
+const tabVoice = document.getElementById('tab-voice');
+const paneText = document.getElementById('pane-text');
+const paneVoice = document.getElementById('pane-voice');
+
+const NOTE_MAX = 120;   // 墨水屏正文约 6 行 × 24 字，超过会被截断
+
+function updateCounter() {
+  const n = noteEl.value.length;
+  counterEl.textContent = n + ' / ' + NOTE_MAX;
+  counterEl.className = 'counter' + (n > NOTE_MAX ? ' warn' : '');
+}
+
+// 统一推送入口（文字/语音都走这里）
+function publishNote(text) {
+  text = (text || '').trim();
+  if (!text) return false;
+  if (!client || !client.connected) {
+    statusEl.textContent = '✗ 还没连上 MQTT，等状态变绿再试';
+    statusEl.className = 'status';
+    return false;
+  }
+  const topic = topicInput.value.trim();
+  client.publish(topic, text, { qos: 0 });
+  transcriptEl.textContent = text;
+  statusEl.textContent = '✓ 已发送，等屏幕下次唤醒刷新';
+  statusEl.className = 'status online';
+  return true;
+}
+
+sendBtn.addEventListener('click', () => publishNote(noteEl.value));
+noteEl.addEventListener('input', updateCounter);
+noteEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {   // Enter 发送，Shift+Enter 换行
+    e.preventDefault();
+    publishNote(noteEl.value);
+  }
+});
+
+function showTab(which) {
+  const isText = (which === 'text');
+  tabText.classList.toggle('active', isText);
+  tabVoice.classList.toggle('active', !isText);
+  paneText.classList.toggle('hidden', !isText);
+  paneVoice.classList.toggle('hidden', isText);
+}
+tabText.addEventListener('click', () => showTab('text'));
+tabVoice.addEventListener('click', () => showTab('voice'));
+updateCounter();
 
 // ============ 启动 ============
 connectMQTT();
