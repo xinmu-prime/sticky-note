@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>语音便利贴推送</title>
+<!-- MQTT 库：多个 CDN 依次兜底（国内 unpkg/jsdelivr 有时很慢，所以加了两个国内镜像） -->
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script>if (typeof mqtt === 'undefined') document.write('<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"><\/script>');</script>
+<script>if (typeof mqtt === 'undefined') document.write('<script src="https://cdn.bootcdn.net/ajax/libs/mqtt/5.10.1/mqtt.min.js"><\/script>');</script>
+<script>if (typeof mqtt === 'undefined') document.write('<script src="https://lib.baomitu.com/mqtt/5.10.1/mqtt.min.js"><\/script>');</script>
+<script>
+  // 四个 CDN 全失败时给个明确提示，不然页面只会一直显示"连接中"
+  window.addEventListener('DOMContentLoaded', function () {
+    if (typeof mqtt === 'undefined') {
+      var s = document.getElementById('status');
+      if (s) {
+        s.textContent = 'MQTT 库加载失败（网络不通），请换 Wi-Fi/4G 重试';
+        s.style.color = '#c62828';
+      }
+    }
+  });
+</script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, sans-serif;
+    background: #f5f5f5;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+  }
+  h1 { font-size: 20px; margin: 20px 0; color: #333; }
+  .status {
+    padding: 6px 14px; border-radius: 20px; font-size: 13px;
+    margin-bottom: 20px; background: #eee; color: #666;
+  }
+  .status.online { background: #d4edda; color: #155724; }
+  .status.listening { background: #fff3cd; color: #856404; animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: 0.6; } }
+
+  .mic-btn {
+    width: 120px; height: 120px; border-radius: 50%;
+    background: #4a90d9; color: white;
+    border: none; font-size: 48px;
+    box-shadow: 0 4px 20px rgba(74,144,217,0.4);
+    margin: 20px 0;
+    transition: transform 0.1s;
+  }
+  .mic-btn:active { transform: scale(0.92); }
+  .mic-btn.listening { background: #e74c3c; animation: pulse 1s infinite; }
+
+  .result {
+    width: 100%; max-width: 400px;
+    background: white; border-radius: 12px; padding: 16px;
+    margin-top: 20px; font-size: 16px; color: #333;
+    min-height: 80px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+  }
+  .result .label { font-size: 12px; color: #999; margin-bottom: 8px; }
+  .hint { font-size: 13px; color: #999; margin-top: 16px; text-align: center; line-height: 1.6; }
+
+  .topic-input {
+    width: 100%; max-width: 400px;
+    padding: 10px; font-size: 14px;
+    border: 1px solid #ddd; border-radius: 8px;
+    margin-bottom: 10px;
+  }
+</style>
+</head>
+<body>
+  <h1>语音便利贴推送</h1>
+  <div id="status" class="status">连接中...</div>
+
+  <input id="topic" class="topic-input" value="ai-sticky/note/my-note-001"
+         placeholder="MQTT Topic (和固件一致)">
+
+  <button id="mic" class="mic-btn">🎤</button>
+
+  <div class="result">
+    <div class="label">识别结果（自动推送到墨水屏）</div>
+    <div id="transcript">— 点击麦克风开始说话 —</div>
+  </div>
+
+  <div class="hint">
+    按住或点击麦克风说话<br>
+    说完自动识别并推送<br>
+    需要 Chrome / Safari 浏览器，需 HTTPS 或 localhost 环境
+  </div>
+
+<script>
+// ============ MQTT 配置 ============
+const MQTT_URL = 'wss://broker.emqx.io:8084/mqtt';
+
+const statusEl = document.getElementById('status');
+const micBtn = document.getElementById('mic');
+const transcriptEl = document.getElementById('transcript');
+const topicInput = document.getElementById('topic');
+
+let client = null;
+let recognition = null;
+let isListening = false;
+
+// ============ 连接 MQTT ============
+function connectMQTT() {
+  client = mqtt.connect(MQTT_URL, {
+    clientId: 'web-' + Math.random().toString(16).slice(2, 10),
+    clean: true,
+    connectTimeout: 5000,
+  });
+
+  client.on('connect', () => {
+    statusEl.textContent = '● 已连接, 可以说话';
+    statusEl.className = 'status online';
+  });
+  client.on('error', (e) => {
+    statusEl.textContent = 'MQTT 连接失败';
+    statusEl.className = 'status';
+    console.error(e);
+  });
+}
+
+// ============ 语音识别 ============
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+if (!SpeechRecognition) {
+  transcriptEl.textContent = '当前浏览器不支持语音识别, 请用 Chrome';
+  micBtn.disabled = true;
+} else {
+  recognition = new SpeechRecognition();
+  recognition.lang = 'zh-CN';
+  recognition.continuous = false;
+  recognition.interimResults = true;
+
+  recognition.onresult = (e) => {
+    let text = '';
+    for (let i = 0; i < e.results.length; i++) {
+      text += e.results[i][0].transcript;
+    }
+    transcriptEl.textContent = text;
+
+    // 最终结果 -> 推送
+    if (e.results[e.results.length - 1].isFinal && text.trim()) {
+      const topic = topicInput.value.trim();
+      client.publish(topic, text.trim(), { qos: 0 });
+      statusEl.textContent = '✓ 已推送: ' + text.trim();
+      statusEl.className = 'status online';
+      setTimeout(() => {
+        statusEl.textContent = '● 已连接, 可以说话';
+        statusEl.className = 'status online';
+      }, 2000);
+    }
+  };
+
+  recognition.onerror = (e) => {
+    console.error(e);
+    statusEl.textContent = '语音识别错误: ' + e.error;
+    stopListening();
+  };
+
+  recognition.onend = () => stopListening();
+}
+
+function startListening() {
+  if (!recognition) return;
+  recognition.start();
+  isListening = true;
+  micBtn.classList.add('listening');
+  statusEl.textContent = '● 正在聆听...';
+  statusEl.className = 'status listening';
+  transcriptEl.textContent = '';
+}
+
+function stopListening() {
+  isListening = false;
+  micBtn.classList.remove('listening');
+}
+
+micBtn.addEventListener('click', () => {
+  if (isListening) recognition.stop();
+  else startListening();
+});
+
+// ============ 启动 ============
+connectMQTT();
+</script>
+</body>
+</html>
